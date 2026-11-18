@@ -1,6 +1,8 @@
 import AppKit
+import SwiftUI
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, LibraryHost {
     private static let defaultNoteSize = NSSize(width: 250, height: 220)
     private static let cascadeOffset: CGFloat = 24
     private static let pollInterval: TimeInterval = 5
@@ -15,6 +17,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var hasShownAccessAlert = false
     private var textsStatusItem: NSMenuItem!
     private let servicesProvider = ServicesProvider()
+    private var library: LibraryModel!
+    private var libraryWindow: NSWindow?
+    private var isClassifying = false
+    /// How far back to pull texts into the library the first time it runs.
+    private static let backfillLookback: TimeInterval = 30 * 24 * 60 * 60
 
     private var chatDBPath: String {
         ProcessInfo.processInfo.environment["STICKIESPLUS_CHAT_DB"]
@@ -49,18 +56,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         NSApp.servicesProvider = servicesProvider
         NSUpdateDynamicServices()
 
+        library = LibraryModel(store: store)
+        library.host = self
+        library.defaultStickyFrame = { [unowned self] in
+            NSRect(origin: defaultOrigin(for: Self.defaultNoteSize), size: Self.defaultNoteSize)
+        }
+
         let notes = store.allNotes()
         if notes.isEmpty {
-            newNote(with: "Welcome to Stickies Plus!\n\nText yourself and it shows up in your 📥 inbox note.")
+            newNote(with: "Welcome to Stickies Plus!\n\nText yourself and it shows up in your 📥 inbox note. Open the library with ⌘0.")
         } else {
-            notes.forEach { show($0) }
+            notes.filter(\.isOnDesktop).forEach { show($0) }
+            if controllers.isEmpty { showLibrary(nil) }
         }
 
         importTexts(userInitiated: false)
+        classifyPendingTexts()
         pollTimer = Timer.scheduledTimer(withTimeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
-            self?.importTexts(userInitiated: false)
+            MainActor.assumeIsolated { self?.importTexts(userInitiated: false) }
         }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func showLibrary(_ sender: Any?) {
+        if libraryWindow == nil {
+            let hosting = NSHostingController(rootView: LibraryView(model: library))
+            hosting.sceneBridgingOptions = [.toolbars, .title]
+            let window = NSWindow(contentViewController: hosting)
+            window.title = "Stickies Plus"
+            window.styleMask.insert(.fullSizeContentView)
+            window.appearance = NSAppearance(named: .aqua)  // white, like you asked
+            window.isReleasedWhenClosed = false
+            window.setContentSize(NSSize(width: 1000, height: 640))
+            window.center()
+            window.setFrameAutosaveName("Library")
+            libraryWindow = window
+        }
+        library.reload()
+        libraryWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private var isLibraryKey: Bool {
+        libraryWindow != nil && NSApp.keyWindow === libraryWindow
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -70,7 +108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if controllers.isEmpty { newNote(nil) }
+        if !flag { showLibrary(nil) }
         return true
     }
 
@@ -83,9 +121,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             note.frame.origin = defaultOrigin(for: note.frame.size)  // its screen was disconnected
         }
         let controller = NoteWindowController(note: note, store: store)
-        controller.onDelete = { [weak self] deleted in
-            self?.controllers.removeAll { $0 === deleted }
+        controller.onRemove = { [weak self] removed in
+            self?.controllers.removeAll { $0 === removed }
+            self?.library.reload()
         }
+        controller.onSaved = { [weak self] saved in self?.library.noteSavedOnDesktop(saved) }
         controllers.append(controller)
         controller.showWindow(nil)
         return controller
@@ -96,8 +136,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return NSPoint(x: visible.minX + 40, y: visible.maxY - 40 - size.height)
     }
 
+    /// ⌘N makes a library note when the library is in front, otherwise a sticky.
     @objc func newNote(_ sender: Any?) {
-        newNote(with: nil)
+        if isLibraryKey { library.newNote() } else { newNote(with: nil) }
     }
 
     @discardableResult
@@ -111,7 +152,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if let text { controller.append(text) }
         controller.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        library.reload()
         return controller
+    }
+
+    // MARK: LibraryHost
+
+    func libraryEdited(_ note: Note) -> Bool {
+        guard let controller = controllers.first(where: { $0.note.id == note.id }) else { return false }
+        controller.setContent(note)
+        controller.saveNow()
+        return true
+    }
+
+    func librarySetOnDesktop(_ onDesktop: Bool, note: Note) {
+        if let controller = controllers.first(where: { $0.note.id == note.id }) {
+            guard !onDesktop else { controller.window?.makeKeyAndOrderFront(nil); return }
+            var updated = controller.note
+            updated.isOnDesktop = false
+            store.save(updated)
+            controller.removeFromDesktop()
+        } else if onDesktop {
+            var updated = note
+            updated.isOnDesktop = true
+            store.save(updated)
+            show(updated).window?.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    func libraryDeleted(noteID: Int64) {
+        store.deleteNote(id: noteID)
+        controllers.first(where: { $0.note.id == noteID })?.removeFromDesktop()
     }
 
     @objc func arrangeByColor(_ sender: Any?) {
@@ -137,9 +208,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     // MARK: Texts to self
 
     private var inboxController: NoteWindowController {
-        if let id = store.setting(SettingKey.inboxNoteID).flatMap(Int64.init),
-           let existing = controllers.first(where: { $0.note.id == id }) {
-            return existing
+        if let id = store.setting(SettingKey.inboxNoteID).flatMap(Int64.init) {
+            if let existing = controllers.first(where: { $0.note.id == id }) { return existing }
+            // Inbox was closed into the library: bring it back rather than starting a new one.
+            if var stored = store.allNotes().first(where: { $0.id == id }) {
+                stored.isOnDesktop = true
+                store.save(stored)
+                return show(stored)
+            }
         }
         let inbox = newNote(with: Self.inboxHeader, color: .blue)
         store.setSetting(SettingKey.inboxNoteID, String(inbox.note.id))
@@ -157,6 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             extraHandles: (store.setting(SettingKey.selfHandles) ?? "").split(separator: ",").map(String.init))
         do {
             let latest = try importer.latestRowID()
+            try backfillTextsIfNeeded(importer, latest: latest)
             let lastSeen = store.setting(SettingKey.messagesLastRowID).flatMap(Int64.init)
             let texts = try importer.selfTexts(
                 afterRowID: lastSeen ?? 0, upToRowID: latest,
@@ -165,6 +242,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 let inbox = inboxController
                 texts.forEach { inbox.append("• " + $0.text) }
                 inbox.saveNow()
+                texts.forEach { store.insertText($0) }
+                library.reloadTexts()
+                classifyPendingTexts()
             }
             store.setSetting(SettingKey.messagesLastRowID, String(latest))
             textsStatusItem.title = "Last checked \(Date().formatted(date: .omitted, time: .shortened))"
@@ -172,6 +252,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         } catch {
             textsStatusItem.title = "⚠︎ Needs Full Disk Access"
             if userInitiated || !hasShownAccessAlert { showAccessAlert(error) }
+        }
+    }
+
+    /// First run of the library: pull in the last month of self-texts so there's something to sort.
+    private func backfillTextsIfNeeded(_ importer: MessagesImporter, latest: Int64) throws {
+        guard store.setting(SettingKey.textsBackfilled) == nil else { return }
+        let texts = try importer.selfTexts(afterRowID: 0, upToRowID: latest,
+                                           since: Date().addingTimeInterval(-Self.backfillLookback))
+        texts.forEach { store.insertText($0) }
+        store.setSetting(SettingKey.textsBackfilled, "1")
+        library.reloadTexts()
+        classifyPendingTexts()
+    }
+
+    /// Sorts unsorted texts one at a time with the on-device model.
+    private func classifyPendingTexts() {
+        guard !isClassifying else { return }
+        let pending = store.allTexts().filter { $0.category == nil }
+        guard !pending.isEmpty else { return }
+        isClassifying = true
+        Task { @MainActor in
+            for item in pending {
+                let category = await TextClassifier.classify(item.text)
+                store.setCategory(category, forText: item.id)
+                library.reloadTexts()
+            }
+            isClassifying = false
+            classifyPendingTexts()  // pick up anything that arrived meanwhile
         }
     }
 
@@ -317,6 +425,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         main.addItem(submenu(texts))
 
         let window = NSMenu(title: "Window")
+        window.addItem(item("Notes Library", #selector(showLibrary(_:)), "0", target: self))
+        window.addItem(.separator())
         window.addItem(item("Arrange by Color", #selector(arrangeByColor(_:)), "", target: self))
         window.addItem(item("Arrange by Date", #selector(arrangeByDate(_:)), "", target: self))
         window.addItem(.separator())

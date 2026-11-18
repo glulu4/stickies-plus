@@ -27,8 +27,48 @@ struct Note {
     var isFloating: Bool
     var isTranslucent: Bool
     var isCollapsed: Bool
+    /// Whether the note is shown as a sticky window, or only in the library.
+    var isOnDesktop: Bool
     var createdAt: Date
     var updatedAt: Date
+
+    var plainText: String {
+        content.isEmpty ? "" : (NSAttributedString(rtfd: content, documentAttributes: nil)?.string ?? "")
+    }
+}
+
+enum TextCategory: String, CaseIterable {
+    case todo, idea, shopping, link, note
+
+    var title: String {
+        switch self {
+        case .todo: return "To-Do"
+        case .idea: return "Ideas"
+        case .shopping: return "Shopping"
+        case .link: return "Links"
+        case .note: return "Other"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .todo: return "checklist"
+        case .idea: return "lightbulb"
+        case .shopping: return "cart"
+        case .link: return "link"
+        case .note: return "text.bubble"
+        }
+    }
+}
+
+/// A text you sent yourself, imported from Messages.
+struct TextItem: Identifiable, Equatable {
+    var id: Int64
+    var text: String
+    var date: Date
+    /// nil until the classifier has sorted it.
+    var category: TextCategory?
+    var isDone: Bool
 }
 
 enum SettingKey {
@@ -36,6 +76,7 @@ enum SettingKey {
     static let messagesLastRowID = "messages_last_rowid"
     static let selfHandles = "self_handles"
     static let watchTexts = "watch_texts"
+    static let textsBackfilled = "texts_backfilled"
 }
 
 /// Persists notes and app settings in the app's own SQLite file.
@@ -60,6 +101,20 @@ final class NoteStore {
             )
             """)
         try db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        try db.execute("""
+            CREATE TABLE IF NOT EXISTS texts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_rowid INTEGER NOT NULL UNIQUE,
+                text TEXT NOT NULL,
+                date REAL NOT NULL,
+                category TEXT,
+                done INTEGER NOT NULL DEFAULT 0
+            )
+            """)
+        let noteColumns = try db.query("PRAGMA table_info(notes)").compactMap { $0["name"]?.string }
+        if !noteColumns.contains("on_desktop") {
+            try db.execute("ALTER TABLE notes ADD COLUMN on_desktop INTEGER NOT NULL DEFAULT 1")
+        }
     }
 
     func allNotes() -> [Note] {
@@ -76,20 +131,21 @@ final class NoteStore {
                 isFloating: row["floating"]?.int64 == 1,
                 isTranslucent: row["translucent"]?.int64 == 1,
                 isCollapsed: row["collapsed"]?.int64 == 1,
+                isOnDesktop: row["on_desktop"]?.int64 != 0,
                 createdAt: Date(timeIntervalSince1970: row["created_at"]?.double ?? 0),
                 updatedAt: Date(timeIntervalSince1970: row["updated_at"]?.double ?? 0))
         }
     }
 
-    func createNote(frame: NSRect, color: NoteColor) -> Note {
+    func createNote(frame: NSRect, color: NoteColor, onDesktop: Bool = true) -> Note {
         let now = Date()
         try? db.execute(
-            "INSERT INTO notes (content, color, x, y, w, h, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO notes (content, color, x, y, w, h, on_desktop, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [.blob(Data()), .text(color.rawValue),
              .real(frame.minX), .real(frame.minY), .real(frame.width), .real(frame.height),
-             .real(now.timeIntervalSince1970), .real(now.timeIntervalSince1970)])
+             .integer(onDesktop ? 1 : 0), .real(now.timeIntervalSince1970), .real(now.timeIntervalSince1970)])
         return Note(id: db.lastInsertRowID, content: Data(), color: color, frame: frame,
-                    isFloating: false, isTranslucent: false, isCollapsed: false,
+                    isFloating: false, isTranslucent: false, isCollapsed: false, isOnDesktop: onDesktop,
                     createdAt: now, updatedAt: now)
     }
 
@@ -97,14 +153,50 @@ final class NoteStore {
         try? db.execute(
             """
             UPDATE notes SET content = ?, color = ?, x = ?, y = ?, w = ?, h = ?,
-                floating = ?, translucent = ?, collapsed = ?, updated_at = ?
+                floating = ?, translucent = ?, collapsed = ?, on_desktop = ?, updated_at = ?
             WHERE id = ?
             """,
             [.blob(note.content), .text(note.color.rawValue),
              .real(note.frame.minX), .real(note.frame.minY), .real(note.frame.width), .real(note.frame.height),
              .integer(note.isFloating ? 1 : 0), .integer(note.isTranslucent ? 1 : 0),
-             .integer(note.isCollapsed ? 1 : 0), .real(note.updatedAt.timeIntervalSince1970),
-             .integer(note.id)])
+             .integer(note.isCollapsed ? 1 : 0), .integer(note.isOnDesktop ? 1 : 0),
+             .real(note.updatedAt.timeIntervalSince1970), .integer(note.id)])
+    }
+
+    // MARK: Texts to self
+
+    /// Saves an imported text; returns false if it was already saved.
+    @discardableResult
+    func insertText(_ text: SelfText) -> Bool {
+        try? db.execute(
+            "INSERT OR IGNORE INTO texts (message_rowid, text, date) VALUES (?, ?, ?)",
+            [.integer(text.rowID), .text(text.text), .real(text.date.timeIntervalSince1970)])
+        return ((try? db.query("SELECT changes() AS n").first?["n"]?.int64) ?? 0) > 0
+    }
+
+    func allTexts() -> [TextItem] {
+        let rows = (try? db.query("SELECT * FROM texts ORDER BY date DESC")) ?? []
+        return rows.compactMap { row in
+            guard let id = row["id"]?.int64 else { return nil }
+            return TextItem(
+                id: id,
+                text: row["text"]?.string ?? "",
+                date: Date(timeIntervalSince1970: row["date"]?.double ?? 0),
+                category: row["category"]?.string.flatMap(TextCategory.init(rawValue:)),
+                isDone: row["done"]?.int64 == 1)
+        }
+    }
+
+    func setCategory(_ category: TextCategory, forText id: Int64) {
+        try? db.execute("UPDATE texts SET category = ? WHERE id = ?", [.text(category.rawValue), .integer(id)])
+    }
+
+    func setDone(_ done: Bool, forText id: Int64) {
+        try? db.execute("UPDATE texts SET done = ? WHERE id = ?", [.integer(done ? 1 : 0), .integer(id)])
+    }
+
+    func deleteText(id: Int64) {
+        try? db.execute("DELETE FROM texts WHERE id = ?", [.integer(id)])
     }
 
     func deleteNote(id: Int64) {

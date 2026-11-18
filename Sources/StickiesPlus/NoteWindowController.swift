@@ -27,8 +27,10 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
     private let scrollView: NSScrollView
     private let textView: NSTextView
     private var pendingSave: DispatchWorkItem?
-    /// Called after the user deletes this note.
-    var onDelete: ((NoteWindowController) -> Void)?
+    /// Called when this sticky leaves the desktop (deleted, or moved to the library).
+    var onRemove: ((NoteWindowController) -> Void)?
+    /// Called after every save so the library can refresh.
+    var onSaved: ((Note) -> Void)?
 
     init(note: Note, store: NoteStore) {
         self.note = note
@@ -93,6 +95,17 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
         textChanged()
     }
 
+    /// Replaces the text after an edit made in the library (already saved there).
+    func setContent(_ note: Note) {
+        pendingSave?.cancel()
+        self.note.content = note.content
+        self.note.updatedAt = note.updatedAt
+        let text = note.content.isEmpty ? NSAttributedString()
+            : (NSAttributedString(rtfd: note.content, documentAttributes: nil) ?? NSAttributedString())
+        textView.textStorage?.setAttributedString(text)
+        if self.note.isCollapsed { window?.title = firstLine }
+    }
+
     func textDidChange(_ notification: Notification) {
         textChanged()
     }
@@ -121,6 +134,7 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
                 documentAttributes: [.documentType: NSAttributedString.DocumentType.rtfd]) ?? Data()
         }
         store.save(note)
+        onSaved?(note)
     }
 
     func windowDidMove(_ notification: Notification) {
@@ -144,20 +158,17 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
         window?.setFrameTopLeftPoint(topLeft)
     }
 
-    // MARK: Closing = deleting, like Stickies
+    // MARK: Closing: empty notes are deleted, others move to the library
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !hasAttachments {
-            delete()
-            return false
-        }
-        let alert = NSAlert()
-        alert.messageText = "Delete this note?"
-        alert.informativeText = "“\(firstLine)” will be permanently deleted."
-        alert.addButton(withTitle: "Delete")
-        alert.addButton(withTitle: "Cancel")
-        alert.beginSheetModal(for: sender) { [weak self] response in
-            if response == .alertFirstButtonReturn { self?.delete() }
+            pendingSave?.cancel()
+            store.deleteNote(id: note.id)
+            removeFromDesktop()
+        } else {
+            note.isOnDesktop = false
+            saveNow()
+            removeFromDesktop()
         }
         return false
     }
@@ -166,11 +177,11 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
         textView.textStorage?.containsAttachments ?? false
     }
 
-    private func delete() {
+    /// Hides the window without saving; the library or AppDelegate owns what happens to the note.
+    func removeFromDesktop() {
         pendingSave?.cancel()
-        store.deleteNote(id: note.id)
         window?.orderOut(nil)
-        onDelete?(self)
+        onRemove?(self)
     }
 
     // MARK: Note menu actions

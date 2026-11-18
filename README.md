@@ -8,6 +8,13 @@ A personal, native macOS take on Stickies that also pulls in texts you send your
 - Arrange notes by color or date; export a note as RTF
 - **Make New Sticky Note** in every app's Services menu (right-click selected text)
 - **Texts to Self**: messages you text yourself land in a blue 📥 inbox note within about 5 seconds
+- **Notes Library** (⌘0): a white, Notes-app-style window with a sidebar, note list and editor.
+  Every sticky shows up here too. Close a sticky and it moves to the library; "Show as Sticky" puts it back.
+- **Auto-sorted texts**: each self-text is classified as To-Do, Idea, Shopping, Link or Other by Apple's
+  on-device model (nothing leaves your Mac). To-dos get checkboxes. Recategorize from the right-click menu.
+  Without Apple Intelligence it falls back to simple keyword rules.
+
+Requires macOS 26 or later.
 
 Notes are stored in SQLite at `~/Library/Application Support/StickiesPlus/notes.sqlite`.
 
