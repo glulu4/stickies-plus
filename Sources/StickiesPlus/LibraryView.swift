@@ -31,6 +31,7 @@ struct LibraryView: View {
         List(selection: $model.section) {
             Section("Notes") {
                 sidebarRow(.notes, "All Notes", "note.text")
+                sidebarRow(.recentlyDeleted, "Recently Deleted", "trash")
             }
             Section("Texts to Self") {
                 sidebarRow(.allTexts, "All Texts", "message")
@@ -53,6 +54,8 @@ struct LibraryView: View {
     private var contentList: some View {
         if model.section == .notes || model.section == nil {
             notesList
+        } else if model.isShowingTrash {
+            trashList
         } else {
             textsList
         }
@@ -80,6 +83,52 @@ struct LibraryView: View {
                 ContentUnavailableView("No Notes", systemImage: "note.text", description: Text("Click ✎ to start one."))
             }
         }
+    }
+
+    private var trashList: some View {
+        List(model.visibleNotes, selection: $model.selection) { item in
+            NoteRow(item: item, daysLeft: model.daysLeft(item.note))
+                .tag(LibrarySelection.note(item.id))
+                .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                    Button { model.restoreNote(item.id) } label: {
+                        Label("Recover", systemImage: "arrow.uturn.backward")
+                    }
+                    .tint(.blue)
+                }
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    Button(role: .destructive) { model.deletePermanently(item.id) } label: {
+                        Label("Delete Forever", systemImage: "trash.slash")
+                    }
+                }
+                .contextMenu {
+                    Button("Recover") { model.restoreNote(item.id) }
+                    Divider()
+                    Button("Delete Permanently", role: .destructive) { model.deletePermanently(item.id) }
+                }
+        }
+        .overlay {
+            if model.visibleNotes.isEmpty {
+                ContentUnavailableView(
+                    "No Recently Deleted Notes", systemImage: "trash",
+                    description: Text("Deleted notes stay here for \(LibraryModel.trashRetentionDays) days."))
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
+            if !model.deletedNotes.isEmpty {
+                Button("Delete All", role: .destructive) { confirmEmptyTrash() }
+                    .padding(10)
+            }
+        }
+    }
+
+    private func confirmEmptyTrash() {
+        let alert = NSAlert()
+        alert.messageText = "Delete all \(model.deletedNotes.count) notes permanently?"
+        alert.informativeText = "This can’t be undone."
+        alert.addButton(withTitle: "Delete All")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+        if alert.runModal() == .alertFirstButtonReturn { model.emptyTrash() }
     }
 
     private var textsList: some View {
@@ -116,7 +165,19 @@ struct LibraryView: View {
     private var detail: some View {
         switch model.selection {
         case .note(let id):
-            if let item = model.note(id) {
+            if let item = model.note(id), item.note.deletedAt != nil {
+                NoteEditor(note: item.note, isEditable: false) { _ in }
+                    .id(id)
+                    .safeAreaInset(edge: .top) {
+                        HStack {
+                            Text("This note is in Recently Deleted.").foregroundStyle(.secondary)
+                            Button("Recover") { model.restoreNote(id) }
+                        }
+                        .padding(8)
+                        .frame(maxWidth: .infinity)
+                        .background(Color(white: 0.96))
+                    }
+            } else if let item = model.note(id) {
                 NoteEditor(note: item.note) { model.updateContent(noteID: id, content: $0) }
                     .id(id)
                     .toolbar {
@@ -155,6 +216,8 @@ private func shortDate(_ date: Date) -> String {
 
 private struct NoteRow: View {
     let item: LibraryNote
+    /// Shown instead of the preview for notes in Recently Deleted.
+    var daysLeft: Int? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -170,7 +233,11 @@ private struct NoteRow: View {
             }
             HStack(spacing: 6) {
                 Text(shortDate(item.note.updatedAt))
-                Text(item.preview).foregroundStyle(.secondary).lineLimit(1)
+                if let daysLeft {
+                    Text(daysLeft == 1 ? "1 day left" : "\(daysLeft) days left").foregroundStyle(.secondary)
+                } else {
+                    Text(item.preview).foregroundStyle(.secondary).lineLimit(1)
+                }
             }
             .font(.subheadline)
         }
@@ -263,6 +330,7 @@ private struct TextDetail: View {
 /// White rich-text editor; saves shortly after typing stops.
 private struct NoteEditor: NSViewRepresentable {
     let note: Note
+    var isEditable = true
     let onChange: (Data) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -275,6 +343,7 @@ private struct NoteEditor: NSViewRepresentable {
         textView.allowsUndo = true
         textView.usesFindBar = true
         textView.usesFontPanel = true
+        textView.isEditable = isEditable
         textView.drawsBackground = true
         textView.backgroundColor = .white
         textView.textContainerInset = NSSize(width: 24, height: 20)

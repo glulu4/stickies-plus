@@ -29,6 +29,8 @@ struct Note {
     var isCollapsed: Bool
     /// Whether the note is shown as a sticky window, or only in the library.
     var isOnDesktop: Bool
+    /// Set when moved to Recently Deleted; nil for live notes.
+    var deletedAt: Date? = nil
     var createdAt: Date
     var updatedAt: Date
 
@@ -115,6 +117,9 @@ final class NoteStore {
         if !noteColumns.contains("on_desktop") {
             try db.execute("ALTER TABLE notes ADD COLUMN on_desktop INTEGER NOT NULL DEFAULT 1")
         }
+        if !noteColumns.contains("deleted_at") {
+            try db.execute("ALTER TABLE notes ADD COLUMN deleted_at REAL")
+        }
     }
 
     func allNotes() -> [Note] {
@@ -132,6 +137,7 @@ final class NoteStore {
                 isTranslucent: row["translucent"]?.int64 == 1,
                 isCollapsed: row["collapsed"]?.int64 == 1,
                 isOnDesktop: row["on_desktop"]?.int64 != 0,
+                deletedAt: row["deleted_at"]?.double.map(Date.init(timeIntervalSince1970:)),
                 createdAt: Date(timeIntervalSince1970: row["created_at"]?.double ?? 0),
                 updatedAt: Date(timeIntervalSince1970: row["updated_at"]?.double ?? 0))
         }
@@ -199,8 +205,25 @@ final class NoteStore {
         try? db.execute("DELETE FROM texts WHERE id = ?", [.integer(id)])
     }
 
+    /// Permanently removes a note.
     func deleteNote(id: Int64) {
         try? db.execute("DELETE FROM notes WHERE id = ?", [.integer(id)])
+    }
+
+    /// Moves a note to Recently Deleted (and off the desktop).
+    func trashNote(id: Int64) {
+        try? db.execute("UPDATE notes SET deleted_at = ?, on_desktop = 0 WHERE id = ?",
+                        [.real(Date().timeIntervalSince1970), .integer(id)])
+    }
+
+    func restoreNote(id: Int64) {
+        try? db.execute("UPDATE notes SET deleted_at = NULL WHERE id = ?", [.integer(id)])
+    }
+
+    /// Permanently removes notes that have been in Recently Deleted longer than `age`.
+    func purgeTrash(olderThan age: TimeInterval) {
+        try? db.execute("DELETE FROM notes WHERE deleted_at IS NOT NULL AND deleted_at < ?",
+                        [.real(Date().timeIntervalSince1970 - age)])
     }
 
     func setting(_ key: String) -> String? {

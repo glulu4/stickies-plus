@@ -56,6 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         NSApp.servicesProvider = servicesProvider
         NSUpdateDynamicServices()
 
+        store.purgeTrash(olderThan: TimeInterval(LibraryModel.trashRetentionDays) * 24 * 60 * 60)
         library = LibraryModel(store: store)
         library.host = self
         library.defaultStickyFrame = { [unowned self] in
@@ -66,7 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if notes.isEmpty {
             newNote(with: "Welcome to Stickies Plus!\n\nText yourself and it shows up in your 📥 inbox note. Open the library with ⌘0.")
         } else {
-            notes.filter(\.isOnDesktop).forEach { show($0) }
+            notes.filter { $0.isOnDesktop && $0.deletedAt == nil }.forEach { show($0) }
             if controllers.isEmpty { showLibrary(nil) }
         }
 
@@ -180,9 +181,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
     }
 
-    func libraryDeleted(noteID: Int64) {
-        store.deleteNote(id: noteID)
-        controllers.first(where: { $0.note.id == noteID })?.removeFromDesktop()
+    func libraryRemovedSticky(noteID: Int64) {
+        guard let controller = controllers.first(where: { $0.note.id == noteID }) else { return }
+        controller.saveNow()  // keep the last few keystrokes before it goes to Recently Deleted
+        controller.removeFromDesktop()
     }
 
     @objc func arrangeByColor(_ sender: Any?) {
@@ -211,7 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if let id = store.setting(SettingKey.inboxNoteID).flatMap(Int64.init) {
             if let existing = controllers.first(where: { $0.note.id == id }) { return existing }
             // Inbox was closed into the library: bring it back rather than starting a new one.
-            if var stored = store.allNotes().first(where: { $0.id == id }) {
+            if var stored = store.allNotes().first(where: { $0.id == id && $0.deletedAt == nil }) {
                 stored.isOnDesktop = true
                 store.save(stored)
                 return show(stored)

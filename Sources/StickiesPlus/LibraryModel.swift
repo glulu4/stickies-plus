@@ -7,11 +7,13 @@ protocol LibraryHost: AnyObject {
     /// Pushes a library edit into an open sticky; returns false if the note has no sticky window.
     func libraryEdited(_ note: Note) -> Bool
     func librarySetOnDesktop(_ onDesktop: Bool, note: Note)
-    func libraryDeleted(noteID: Int64)
+    /// Closes the note's sticky window, if it has one.
+    func libraryRemovedSticky(noteID: Int64)
 }
 
 enum LibrarySection: Hashable {
     case notes
+    case recentlyDeleted
     case allTexts
     case category(TextCategory)
 }
@@ -45,7 +47,11 @@ struct LibraryNote: Identifiable {
 /// State for the Notes-style library window.
 @MainActor
 final class LibraryModel: ObservableObject {
+    /// Days a note stays in Recently Deleted before it's removed for good.
+    static let trashRetentionDays = 30
+
     @Published private(set) var notes: [LibraryNote] = []
+    @Published private(set) var deletedNotes: [LibraryNote] = []
     @Published private(set) var texts: [TextItem] = []
     @Published var section: LibrarySection? = .notes {
         didSet { if oldValue != section { selection = nil } }
@@ -64,9 +70,15 @@ final class LibraryModel: ObservableObject {
     }
 
     func reload() {
-        notes = store.allNotes().map(LibraryNote.init).sorted { $0.note.updatedAt > $1.note.updatedAt }
+        let all = store.allNotes()
+        notes = all.filter { $0.deletedAt == nil }.map(LibraryNote.init)
+            .sorted { $0.note.updatedAt > $1.note.updatedAt }
+        deletedNotes = all.filter { $0.deletedAt != nil }.map(LibraryNote.init)
+            .sorted { ($0.note.deletedAt ?? .distantPast) > ($1.note.deletedAt ?? .distantPast) }
         reloadTexts()
     }
+
+    var isShowingTrash: Bool { section == .recentlyDeleted }
 
     func reloadTexts() {
         texts = store.allTexts()
@@ -79,7 +91,7 @@ final class LibraryModel: ObservableObject {
     }
 
     var visibleNotes: [LibraryNote] {
-        notes.filter { matchesSearch($0.plainText) }
+        (isShowingTrash ? deletedNotes : notes).filter { matchesSearch($0.plainText) }
     }
 
     var visibleTexts: [TextItem] {
@@ -93,13 +105,23 @@ final class LibraryModel: ObservableObject {
     func count(_ section: LibrarySection) -> Int {
         switch section {
         case .notes: return notes.count
+        case .recentlyDeleted: return deletedNotes.count
         case .allTexts: return texts.count
         case .category(let category):
             return texts.filter { $0.category == category && !($0.category == .todo && $0.isDone) }.count
         }
     }
 
-    func note(_ id: Int64) -> LibraryNote? { notes.first { $0.id == id } }
+    func note(_ id: Int64) -> LibraryNote? {
+        notes.first { $0.id == id } ?? deletedNotes.first { $0.id == id }
+    }
+
+    /// e.g. "29 days left" for a note in Recently Deleted.
+    func daysLeft(_ note: Note) -> Int {
+        guard let deletedAt = note.deletedAt else { return Self.trashRetentionDays }
+        let elapsed = Calendar.current.dateComponents([.day], from: deletedAt, to: Date()).day ?? 0
+        return max(Self.trashRetentionDays - elapsed, 0)
+    }
     func text(_ id: Int64) -> TextItem? { texts.first { $0.id == id } }
 
     // MARK: Notes
@@ -145,9 +167,30 @@ final class LibraryModel: ObservableObject {
         reload()
     }
 
+    /// Moves a note to Recently Deleted.
     func deleteNote(_ noteID: Int64) {
-        host?.libraryDeleted(noteID: noteID)
+        host?.libraryRemovedSticky(noteID: noteID)
+        store.trashNote(id: noteID)
         if selection == .note(noteID) { selection = nil }
+        reload()
+    }
+
+    func restoreNote(_ noteID: Int64) {
+        store.restoreNote(id: noteID)
+        reload()
+        section = .notes
+        selection = .note(noteID)
+    }
+
+    func deletePermanently(_ noteID: Int64) {
+        store.deleteNote(id: noteID)
+        if selection == .note(noteID) { selection = nil }
+        reload()
+    }
+
+    func emptyTrash() {
+        deletedNotes.forEach { store.deleteNote(id: $0.id) }
+        selection = nil
         reload()
     }
 
