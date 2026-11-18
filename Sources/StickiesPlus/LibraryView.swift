@@ -62,6 +62,11 @@ struct LibraryView: View {
         List(model.visibleNotes, selection: $model.selection) { item in
             NoteRow(item: item)
                 .tag(LibrarySelection.note(item.id))
+                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    Button(role: .destructive) { model.deleteNote(item.id) } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                }
                 .contextMenu {
                     Button(item.note.isOnDesktop ? "Remove from Desktop" : "Show as Sticky") {
                         model.setOnDesktop(!item.note.isOnDesktop, noteID: item.id)
@@ -81,6 +86,11 @@ struct LibraryView: View {
         List(model.visibleTexts, selection: $model.selection) { item in
             TextRow(item: item, showCategory: model.section == .allTexts) { model.toggleDone(item.id) }
                 .tag(LibrarySelection.text(item.id))
+                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    Button(role: .destructive) { model.deleteText(item.id) } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                }
                 .contextMenu {
                     Menu("Move to") {
                         ForEach(TextCategory.allCases, id: \.self) { category in
