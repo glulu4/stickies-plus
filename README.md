@@ -7,13 +7,16 @@ A personal, native macOS take on Stickies that also pulls in texts you send your
 - Six note colors, Float on Top, Translucent, and collapse by double-clicking the title bar
 - Arrange notes by color or date; export a note as RTF
 - **Make New Sticky Note** in every app's Services menu (right-click selected text)
-- **Texts to Self**: messages you text yourself land in a blue 📥 inbox note within about 5 seconds
-- **Notes Library** (⌘0): a white, Notes-app-style window with a sidebar, note list and editor.
-  Every sticky shows up here too. Close a sticky and it moves to the library; "Show as Sticky" puts it back.
-  Two-finger swipe left to delete; deleted notes stay in Recently Deleted for 30 days (swipe right to recover).
-- **Auto-sorted texts**: each self-text is classified as To-Do, Idea, Shopping, Link or Other by Apple's
-  on-device model (nothing leaves your Mac). To-dos get checkboxes. Recategorize from the right-click menu.
-  Without Apple Intelligence it falls back to simple keyword rules.
+- **Texts to Self, filed automatically**: give a sticky a title (right-click its title bar → Set Title…,
+  or ⌘⇧T), e.g. "🛒 Groceries". Texts you send yourself land on the titled sticky they fit within about
+  5 seconds, or in **📥 Inbox** when nothing fits. Untitled stickies never receive texts.
+  - Shortcut: start a text with a title to skip the guessing: `groceries: eggs`, `groc: eggs` or `#groceries eggs`
+    (case and emoji ignored, a unique beginning is enough; the prefix is removed).
+  - Otherwise Apple's on-device model picks, using each sticky's title and last few lines as examples.
+    Nothing leaves your Mac. Without Apple Intelligence, only the shortcut works and the rest goes to the inbox.
+  - The receiving sticky blinks; collapsed stickies show "+N". Hover a filed line to see when you sent it.
+- **Recently Closed** (Window menu): closing a sticky keeps it for 30 days so you can reopen it.
+  Closing an empty, untitled sticky deletes it.
 
 Requires macOS 26 or later.
 

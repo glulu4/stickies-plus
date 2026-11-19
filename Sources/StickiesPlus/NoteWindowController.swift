@@ -1,16 +1,21 @@
 import AppKit
 import UniformTypeIdentifiers
 
-/// Panel that turns a title-bar double-click into collapse/expand, like Stickies.
+/// Panel that handles title-bar clicks like Stickies: double-click collapses, right-click shows options.
 final class NotePanel: NSPanel {
     var onTitleBarDoubleClick: (() -> Void)?
+    var onTitleBarRightClick: ((NSEvent) -> Void)?
 
     override var canBecomeKey: Bool { true }
 
     override func sendEvent(_ event: NSEvent) {
-        if event.type == .leftMouseDown, event.clickCount == 2,
-           event.locationInWindow.y > contentLayoutRect.maxY {
+        let inTitleBar = event.locationInWindow.y > contentLayoutRect.maxY
+        if inTitleBar, event.type == .leftMouseDown, event.clickCount == 2 {
             onTitleBarDoubleClick?()
+            return
+        }
+        if inTitleBar, event.type == .rightMouseDown {
+            onTitleBarRightClick?(event)
             return
         }
         super.sendEvent(event)
@@ -21,16 +26,20 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
     private static let saveDelay: TimeInterval = 0.5
     private static let translucentAlpha: CGFloat = 0.6
     private static let defaultFont = NSFont.systemFont(ofSize: 14)
+    static let bullet = "• "
+    private static let glowAlpha: CGFloat = 0.35
+    private static let glowStepDuration: TimeInterval = 0.18
+    private static let glowBlinks = 2
 
     private(set) var note: Note
     private let store: NoteStore
     private let scrollView: NSScrollView
     private let textView: NSTextView
     private var pendingSave: DispatchWorkItem?
-    /// Called when this sticky leaves the desktop (deleted, or moved to the library).
+    /// Texts filed while collapsed; shown as "+N" until expanded.
+    private var unseenCount = 0
+    /// Called when this sticky leaves the desktop (closed or deleted).
     var onRemove: ((NoteWindowController) -> Void)?
-    /// Called after every save so the library can refresh.
-    var onSaved: ((Note) -> Void)?
 
     init(note: Note, store: NoteStore) {
         self.note = note
@@ -70,9 +79,12 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
         panel.delegate = self
         textView.delegate = self
         panel.onTitleBarDoubleClick = { [weak self] in self?.toggleCollapsed(nil) }
+        panel.onTitleBarRightClick = { [weak self] event in self?.showTitleBarMenu(event) }
 
         applyAppearance()
         if note.isCollapsed { applyCollapsed() }
+        updateTitleBar()
+        applyTimestamps(store.routedTexts(noteID: note.id))
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -86,24 +98,53 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
         return line.trimmingCharacters(in: .whitespaces).isEmpty ? "Note" : line
     }
 
-    func append(_ text: String) {
+    private var hasTitle: Bool { !(note.title ?? "").isEmpty }
+
+    func append(_ text: String, toolTip: String? = nil) {
         guard let storage = textView.textStorage else { return }
-        var attributes = textView.typingAttributes
-        attributes[.font] = attributes[.font] ?? Self.defaultFont
+        var attributes = baseTypingAttributes
+        if let toolTip { attributes[.toolTip] = toolTip }
         let needsNewline = storage.length > 0 && !storage.string.hasSuffix("\n")
         storage.append(NSAttributedString(string: (needsNewline ? "\n" : "") + text, attributes: attributes))
+        textView.typingAttributes = baseTypingAttributes
         textChanged()
     }
 
-    /// Replaces the text after an edit made in the library (already saved there).
-    func setContent(_ note: Note) {
-        pendingSave?.cancel()
-        self.note.content = note.content
-        self.note.updatedAt = note.updatedAt
-        let text = note.content.isEmpty ? NSAttributedString()
-            : (NSAttributedString(rtfd: note.content, documentAttributes: nil) ?? NSAttributedString())
-        textView.textStorage?.setAttributedString(text)
-        if self.note.isCollapsed { window?.title = firstLine }
+    /// Adds a text you sent yourself as a bullet, with its send time on hover.
+    func file(_ text: String, sentAt date: Date) {
+        append(Self.bullet + text, toolTip: Self.timestampToolTip(date))
+        if note.isCollapsed { unseenCount += 1 }
+        updateTitleBar()
+        glow()
+        saveNow()
+    }
+
+    private var baseTypingAttributes: [NSAttributedString.Key: Any] {
+        var attributes = textView.typingAttributes
+        attributes[.font] = attributes[.font] ?? Self.defaultFont
+        attributes[.toolTip] = nil
+        return attributes
+    }
+
+    private static func timestampToolTip(_ date: Date) -> String {
+        "Texted \(date.formatted(date: .abbreviated, time: .shortened))"
+    }
+
+    /// Tooltips don't survive saving, so re-attach them to filed lines on load.
+    private func applyTimestamps(_ entries: [(text: String, date: Date)]) {
+        guard let storage = textView.textStorage else { return }
+        let string = storage.string as NSString
+        for entry in entries {
+            let range = string.range(of: Self.bullet + entry.text)
+            if range.location != NSNotFound {
+                storage.addAttribute(.toolTip, value: Self.timestampToolTip(entry.date), range: range)
+            }
+        }
+    }
+
+    func textViewDidChangeSelection(_ notification: Notification) {
+        // Don't let new typing inherit a filed line's tooltip.
+        textView.typingAttributes[.toolTip] = nil
     }
 
     func textDidChange(_ notification: Notification) {
@@ -111,9 +152,66 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
     }
 
     private func textChanged() {
-        if note.isCollapsed { window?.title = firstLine }
+        if note.isCollapsed { updateTitleBar() }
         note.updatedAt = Date()
         scheduleSave()
+    }
+
+    // MARK: Title
+
+    private func updateTitleBar() {
+        guard let window else { return }
+        var text = hasTitle ? note.title! : (note.isCollapsed ? firstLine : "")
+        if note.isCollapsed && unseenCount > 0 { text += "  +\(unseenCount)" }
+        window.title = text
+        window.titleVisibility = text.isEmpty ? .hidden : .visible
+    }
+
+    @objc func editTitle(_ sender: Any?) {
+        guard let window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Sticky Title"
+        alert.informativeText = "Titled stickies receive matching texts you send yourself. Leave empty for a plain sticky."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = note.title ?? ""
+        field.placeholderString = "e.g. 🛒 Groceries"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .alertFirstButtonReturn else { return }
+            let title = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            note.title = title.isEmpty ? nil : title
+            updateTitleBar()
+            saveNow()
+        }
+    }
+
+    private func showTitleBarMenu(_ event: NSEvent) {
+        let menu = NSMenu()
+        menu.addItem(withTitle: hasTitle ? "Rename…" : "Set Title…", action: #selector(editTitle(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: note.isCollapsed ? "Expand" : "Collapse", action: #selector(toggleCollapsed(_:)), keyEquivalent: "")
+        menu.items.forEach { $0.target = self }
+        if let view = window?.contentView?.superview {
+            NSMenu.popUpContextMenu(menu, with: event, for: view)
+        }
+    }
+
+    /// Quick blink so you notice a text landing here.
+    private func glow() {
+        guard let window else { return }
+        let restingAlpha = note.isTranslucent ? Self.translucentAlpha : 1
+        var steps: [CGFloat] = []
+        for _ in 0..<Self.glowBlinks { steps += [Self.glowAlpha, restingAlpha] }
+        func run(_ remaining: ArraySlice<CGFloat>) {
+            guard let next = remaining.first else { return }
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = Self.glowStepDuration
+                window.animator().alphaValue = next
+            }, completionHandler: { run(remaining.dropFirst()) })
+        }
+        run(steps[...])
     }
 
     // MARK: Persistence
@@ -134,7 +232,6 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
                 documentAttributes: [.documentType: NSAttributedString.DocumentType.rtfd]) ?? Data()
         }
         store.save(note)
-        onSaved?(note)
     }
 
     func windowDidMove(_ notification: Notification) {
@@ -158,30 +255,24 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
         window?.setFrameTopLeftPoint(topLeft)
     }
 
-    // MARK: Closing: empty notes are deleted, others move to the library
+    // MARK: Closing: empty notes are deleted, others go to Window → Recently Closed
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        if plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !hasAttachments {
+        if plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !hasAttachments && !hasTitle {
             pendingSave?.cancel()
             store.deleteNote(id: note.id)
-            removeFromDesktop()
         } else {
-            note.isOnDesktop = false
             saveNow()
-            removeFromDesktop()
+            store.closeNote(id: note.id)
         }
+        pendingSave?.cancel()
+        window?.orderOut(nil)
+        onRemove?(self)
         return false
     }
 
     private var hasAttachments: Bool {
         textView.textStorage?.containsAttachments ?? false
-    }
-
-    /// Hides the window without saving; the library or AppDelegate owns what happens to the note.
-    func removeFromDesktop() {
-        pendingSave?.cancel()
-        window?.orderOut(nil)
-        onRemove?(self)
     }
 
     // MARK: Note menu actions
@@ -215,7 +306,13 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
 
     @objc func toggleCollapsed(_ sender: Any?) {
         note.isCollapsed.toggle()
-        if note.isCollapsed { applyCollapsed() } else { applyExpanded() }
+        if note.isCollapsed {
+            applyCollapsed()
+        } else {
+            unseenCount = 0
+            applyExpanded()
+        }
+        updateTitleBar()
         saveNow()
     }
 
@@ -225,8 +322,6 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
         let expanded = note.frame
         scrollView.isHidden = true
         window.styleMask.remove(.resizable)
-        window.title = firstLine
-        window.titleVisibility = .visible
         window.setFrame(NSRect(x: expanded.minX, y: expanded.maxY - titleBarHeight,
                                width: expanded.width, height: titleBarHeight), display: true)
     }
@@ -235,7 +330,6 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
         guard let window else { return }
         let top = window.frame.maxY
         window.styleMask.insert(.resizable)
-        window.titleVisibility = .hidden
         window.setFrame(NSRect(x: window.frame.minX, y: top - note.frame.height,
                                width: note.frame.width, height: note.frame.height), display: true)
         scrollView.isHidden = false
@@ -245,7 +339,7 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
         guard let window, let storage = textView.textStorage else { return }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.rtf]
-        panel.nameFieldStringValue = firstLine.prefix(40) + ".rtf"
+        panel.nameFieldStringValue = note.displayName.prefix(40) + ".rtf"
         panel.beginSheetModal(for: window) { response in
             guard response == .OK, let url = panel.url else { return }
             let data = storage.rtf(from: NSRange(location: 0, length: storage.length),
@@ -264,6 +358,8 @@ final class NoteWindowController: NSWindowController, NSWindowDelegate, NSTextVi
             menuItem.state = note.isTranslucent ? .on : .off
         case #selector(toggleCollapsed(_:)):
             menuItem.title = note.isCollapsed ? "Expand" : "Collapse"
+        case #selector(editTitle(_:)):
+            menuItem.title = hasTitle ? "Rename…" : "Set Title…"
         default:
             break
         }

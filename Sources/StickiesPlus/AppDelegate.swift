@@ -1,14 +1,18 @@
 import AppKit
-import SwiftUI
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, LibraryHost {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSMenuDelegate {
     private static let defaultNoteSize = NSSize(width: 250, height: 220)
     private static let cascadeOffset: CGFloat = 24
     private static let pollInterval: TimeInterval = 5
     /// On first launch, pull in self-texts from this far back.
     private static let firstImportLookback: TimeInterval = 24 * 60 * 60
-    private static let inboxHeader = "📥 Texts to Self"
+    private static let inboxTitle = "📥 Inbox"
+    /// Closed stickies stay in Window → Recently Closed this long.
+    private static let closedRetention: TimeInterval = 30 * 24 * 60 * 60
+    /// How many recent lines of each sticky the router sees as examples.
+    private static let routingExampleLines = 5
+    private static let recentlyClosedNameLength = 40
     private static let fullDiskAccessURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!
 
     private var store: NoteStore!
@@ -16,12 +20,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private var pollTimer: Timer?
     private var hasShownAccessAlert = false
     private var textsStatusItem: NSMenuItem!
+    private let recentlyClosedMenu = NSMenu(title: "Recently Closed")
     private let servicesProvider = ServicesProvider()
-    private var library: LibraryModel!
-    private var libraryWindow: NSWindow?
-    private var isClassifying = false
-    /// How far back to pull texts into the library the first time it runs.
-    private static let backfillLookback: TimeInterval = 30 * 24 * 60 * 60
+    private var isRouting = false
 
     private var chatDBPath: String {
         ProcessInfo.processInfo.environment["STICKIESPLUS_CHAT_DB"]
@@ -56,50 +57,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         NSApp.servicesProvider = servicesProvider
         NSUpdateDynamicServices()
 
-        store.purgeTrash(olderThan: TimeInterval(LibraryModel.trashRetentionDays) * 24 * 60 * 60)
-        library = LibraryModel(store: store)
-        library.host = self
-        library.defaultStickyFrame = { [unowned self] in
-            NSRect(origin: defaultOrigin(for: Self.defaultNoteSize), size: Self.defaultNoteSize)
-        }
+        store.purgeClosedNotes(olderThan: Self.closedRetention)
+        titleInboxIfNeeded()
 
         let notes = store.allNotes()
         if notes.isEmpty {
-            newNote(with: "Welcome to Stickies Plus!\n\nText yourself and it shows up in your 📥 inbox note. Open the library with ⌘0.")
+            newNote(with: """
+                Welcome to Stickies Plus!
+
+                Right-click a sticky's title bar → Set Title… (e.g. "🛒 Groceries"). \
+                Texts you send yourself land on the sticky they fit, or in 📥 Inbox.
+                """)
         } else {
-            notes.filter { $0.isOnDesktop && $0.deletedAt == nil }.forEach { show($0) }
-            if controllers.isEmpty { showLibrary(nil) }
+            notes.filter { $0.closedAt == nil }.forEach { show($0) }
         }
 
         importTexts(userInitiated: false)
-        classifyPendingTexts()
+        routePendingTexts()
         pollTimer = Timer.scheduledTimer(withTimeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.importTexts(userInitiated: false) }
         }
         NSApp.activate(ignoringOtherApps: true)
-    }
-
-    @objc func showLibrary(_ sender: Any?) {
-        if libraryWindow == nil {
-            let hosting = NSHostingController(rootView: LibraryView(model: library))
-            hosting.sceneBridgingOptions = [.toolbars, .title]
-            let window = NSWindow(contentViewController: hosting)
-            window.title = "Stickies Plus"
-            window.styleMask.insert(.fullSizeContentView)
-            window.appearance = NSAppearance(named: .aqua)  // white, like you asked
-            window.isReleasedWhenClosed = false
-            window.setContentSize(NSSize(width: 1000, height: 640))
-            window.center()
-            window.setFrameAutosaveName("Library")
-            libraryWindow = window
-        }
-        library.reload()
-        libraryWindow?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    private var isLibraryKey: Bool {
-        libraryWindow != nil && NSApp.keyWindow === libraryWindow
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -109,7 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag { showLibrary(nil) }
+        if controllers.isEmpty { newNote(nil) }
         return true
     }
 
@@ -124,9 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let controller = NoteWindowController(note: note, store: store)
         controller.onRemove = { [weak self] removed in
             self?.controllers.removeAll { $0 === removed }
-            self?.library.reload()
         }
-        controller.onSaved = { [weak self] saved in self?.library.noteSavedOnDesktop(saved) }
         controllers.append(controller)
         controller.showWindow(nil)
         return controller
@@ -137,54 +113,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         return NSPoint(x: visible.minX + 40, y: visible.maxY - 40 - size.height)
     }
 
-    /// ⌘N makes a library note when the library is in front, otherwise a sticky.
     @objc func newNote(_ sender: Any?) {
-        if isLibraryKey { library.newNote() } else { newNote(with: nil) }
+        newNote(with: nil)
     }
 
     @discardableResult
-    private func newNote(with text: String?, color: NoteColor = .yellow) -> NoteWindowController {
+    private func newNote(with text: String?, color: NoteColor = .yellow, title: String? = nil) -> NoteWindowController {
         var frame = NSRect(origin: defaultOrigin(for: Self.defaultNoteSize), size: Self.defaultNoteSize)
         if let key = NSApp.keyWindow, controllers.contains(where: { $0.window === key }) {
             frame.origin = NSPoint(x: key.frame.minX + Self.cascadeOffset,
                                    y: key.frame.maxY - Self.cascadeOffset - frame.height)
         }
-        let controller = show(store.createNote(frame: frame, color: color))
+        let controller = show(store.createNote(frame: frame, color: color, title: title))
         if let text { controller.append(text) }
         controller.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        library.reload()
         return controller
-    }
-
-    // MARK: LibraryHost
-
-    func libraryEdited(_ note: Note) -> Bool {
-        guard let controller = controllers.first(where: { $0.note.id == note.id }) else { return false }
-        controller.setContent(note)
-        controller.saveNow()
-        return true
-    }
-
-    func librarySetOnDesktop(_ onDesktop: Bool, note: Note) {
-        if let controller = controllers.first(where: { $0.note.id == note.id }) {
-            guard !onDesktop else { controller.window?.makeKeyAndOrderFront(nil); return }
-            var updated = controller.note
-            updated.isOnDesktop = false
-            store.save(updated)
-            controller.removeFromDesktop()
-        } else if onDesktop {
-            var updated = note
-            updated.isOnDesktop = true
-            store.save(updated)
-            show(updated).window?.makeKeyAndOrderFront(nil)
-        }
-    }
-
-    func libraryRemovedSticky(noteID: Int64) {
-        guard let controller = controllers.first(where: { $0.note.id == noteID }) else { return }
-        controller.saveNow()  // keep the last few keystrokes before it goes to Recently Deleted
-        controller.removeFromDesktop()
     }
 
     @objc func arrangeByColor(_ sender: Any?) {
@@ -207,19 +151,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
     }
 
+    // MARK: Recently Closed
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === recentlyClosedMenu else { return }
+        menu.removeAllItems()
+        let closed = store.closedNotes()
+        if closed.isEmpty {
+            let empty = NSMenuItem(title: "No Recently Closed Stickies", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+            return
+        }
+        for note in closed {
+            var name = note.displayName
+            if name.count > Self.recentlyClosedNameLength {
+                name = String(name.prefix(Self.recentlyClosedNameLength)) + "…"
+            }
+            let entry = item(name, #selector(reopenClosedNote(_:)), "", target: self, tag: Int(note.id))
+            entry.toolTip = "Closed \(note.closedAt!.formatted(.relative(presentation: .named)))"
+            menu.addItem(entry)
+        }
+    }
+
+    @objc func reopenClosedNote(_ sender: NSMenuItem) {
+        let id = Int64(sender.tag)
+        store.reopenNote(id: id)
+        guard let note = store.allNotes().first(where: { $0.id == id }) else { return }
+        show(note).window?.makeKeyAndOrderFront(nil)
+    }
+
     // MARK: Texts to self
 
+    /// The 📥 sticky used to have a header line instead of a title; give it the title.
+    private func titleInboxIfNeeded() {
+        guard let id = store.setting(SettingKey.inboxNoteID).flatMap(Int64.init),
+              var inbox = store.allNotes().first(where: { $0.id == id }),
+              (inbox.title ?? "").isEmpty else { return }
+        inbox.title = Self.inboxTitle
+        store.save(inbox)
+    }
+
+    private var inboxNoteID: Int64? {
+        store.setting(SettingKey.inboxNoteID).flatMap(Int64.init)
+    }
+
+    /// The 📥 Inbox sticky, reopened or recreated if needed.
     private var inboxController: NoteWindowController {
-        if let id = store.setting(SettingKey.inboxNoteID).flatMap(Int64.init) {
+        if let id = inboxNoteID {
             if let existing = controllers.first(where: { $0.note.id == id }) { return existing }
-            // Inbox was closed into the library: bring it back rather than starting a new one.
-            if var stored = store.allNotes().first(where: { $0.id == id && $0.deletedAt == nil }) {
-                stored.isOnDesktop = true
-                store.save(stored)
-                return show(stored)
+            if store.allNotes().contains(where: { $0.id == id }) {
+                store.reopenNote(id: id)
+                if let note = store.allNotes().first(where: { $0.id == id }) { return show(note) }
             }
         }
-        let inbox = newNote(with: Self.inboxHeader, color: .blue)
+        let inbox = newNote(with: nil, color: .blue, title: Self.inboxTitle)
         store.setSetting(SettingKey.inboxNoteID, String(inbox.note.id))
         return inbox
     }
@@ -235,54 +221,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             extraHandles: (store.setting(SettingKey.selfHandles) ?? "").split(separator: ",").map(String.init))
         do {
             let latest = try importer.latestRowID()
-            try backfillTextsIfNeeded(importer, latest: latest)
             let lastSeen = store.setting(SettingKey.messagesLastRowID).flatMap(Int64.init)
             let texts = try importer.selfTexts(
                 afterRowID: lastSeen ?? 0, upToRowID: latest,
                 since: lastSeen == nil ? Date().addingTimeInterval(-Self.firstImportLookback) : nil)
-            if !texts.isEmpty {
-                let inbox = inboxController
-                texts.forEach { inbox.append("• " + $0.text) }
-                inbox.saveNow()
-                texts.forEach { store.insertText($0) }
-                library.reloadTexts()
-                classifyPendingTexts()
-            }
+            texts.forEach { store.insertText($0) }
             store.setSetting(SettingKey.messagesLastRowID, String(latest))
             textsStatusItem.title = "Last checked \(Date().formatted(date: .omitted, time: .shortened))"
-            if userInitiated && texts.isEmpty { inboxController.window?.makeKeyAndOrderFront(nil) }
+            routePendingTexts()
         } catch {
             textsStatusItem.title = "⚠︎ Needs Full Disk Access"
             if userInitiated || !hasShownAccessAlert { showAccessAlert(error) }
         }
     }
 
-    /// First run of the library: pull in the last month of self-texts so there's something to sort.
-    private func backfillTextsIfNeeded(_ importer: MessagesImporter, latest: Int64) throws {
-        guard store.setting(SettingKey.textsBackfilled) == nil else { return }
-        let texts = try importer.selfTexts(afterRowID: 0, upToRowID: latest,
-                                           since: Date().addingTimeInterval(-Self.backfillLookback))
-        texts.forEach { store.insertText($0) }
-        store.setSetting(SettingKey.textsBackfilled, "1")
-        library.reloadTexts()
-        classifyPendingTexts()
-    }
-
-    /// Sorts unsorted texts one at a time with the on-device model.
-    private func classifyPendingTexts() {
-        guard !isClassifying else { return }
-        let pending = store.allTexts().filter { $0.category == nil }
+    /// Files waiting texts one at a time onto the sticky they fit (or the inbox).
+    private func routePendingTexts() {
+        guard !isRouting else { return }
+        let pending = store.pendingTexts()
         guard !pending.isEmpty else { return }
-        isClassifying = true
+        isRouting = true
         Task { @MainActor in
             for item in pending {
-                let category = await TextClassifier.classify(item.text)
-                store.setCategory(category, forText: item.id)
-                library.reloadTexts()
+                let inboxID = inboxNoteID
+                let candidates = controllers
+                    .filter { !($0.note.title ?? "").isEmpty && $0.note.id != inboxID }
+                    .map(routeCandidate)
+                let inbox = controllers.first { $0.note.id == inboxID }.map(routeCandidate)
+                let route = await StickyRouter.route(item.text, candidates: candidates, inbox: inbox)
+                // The chosen sticky may have been closed while the model was thinking.
+                let target = controllers.first { $0.note.id == route.noteID } ?? inboxController
+                target.file(route.text, sentAt: item.date)
+                store.markRouted(textID: item.id, noteID: target.note.id, filedText: route.text)
             }
-            isClassifying = false
-            classifyPendingTexts()  // pick up anything that arrived meanwhile
+            isRouting = false
+            routePendingTexts()  // pick up anything that arrived meanwhile
         }
+    }
+
+    private func routeCandidate(_ controller: NoteWindowController) -> RouteCandidate {
+        let lines = controller.plainText.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .map { $0.hasPrefix(NoteWindowController.bullet) ? String($0.dropFirst(NoteWindowController.bullet.count)) : $0 }
+            .filter { !$0.isEmpty }
+        return RouteCandidate(noteID: controller.note.id, title: controller.note.title ?? "",
+                              recentLines: Array(lines.suffix(Self.routingExampleLines)))
     }
 
     private func showAccessAlert(_ error: Error) {
@@ -410,6 +393,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         note.addItem(item("Float on Top", #selector(NoteWindowController.toggleFloating(_:)), "f", [.command, .option]))
         note.addItem(item("Translucent", #selector(NoteWindowController.toggleTranslucent(_:)), "t", [.command, .option]))
         note.addItem(item("Collapse", #selector(NoteWindowController.toggleCollapsed(_:)), "c", [.command, .option]))
+        note.addItem(.separator())
+        note.addItem(item("Set Title…", #selector(NoteWindowController.editTitle(_:)), "T"))
         main.addItem(submenu(note))
 
         let texts = NSMenu(title: "Texts")
@@ -427,7 +412,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         main.addItem(submenu(texts))
 
         let window = NSMenu(title: "Window")
-        window.addItem(item("Notes Library", #selector(showLibrary(_:)), "0", target: self))
+        recentlyClosedMenu.delegate = self
+        window.addItem(submenu(recentlyClosedMenu))
         window.addItem(.separator())
         window.addItem(item("Arrange by Color", #selector(arrangeByColor(_:)), "", target: self))
         window.addItem(item("Arrange by Date", #selector(arrangeByDate(_:)), "", target: self))

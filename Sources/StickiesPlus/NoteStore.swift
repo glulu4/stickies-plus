@@ -27,50 +27,30 @@ struct Note {
     var isFloating: Bool
     var isTranslucent: Bool
     var isCollapsed: Bool
-    /// Whether the note is shown as a sticky window, or only in the library.
-    var isOnDesktop: Bool
-    /// Set when moved to Recently Deleted; nil for live notes.
-    var deletedAt: Date? = nil
+    /// Optional label. Only titled stickies receive texts.
+    var title: String?
+    /// Set while the note sits in Window → Recently Closed; nil for open stickies.
+    var closedAt: Date?
     var createdAt: Date
     var updatedAt: Date
 
     var plainText: String {
         content.isEmpty ? "" : (NSAttributedString(rtfd: content, documentAttributes: nil)?.string ?? "")
     }
-}
 
-enum TextCategory: String, CaseIterable {
-    case todo, idea, shopping, link, note
-
-    var title: String {
-        switch self {
-        case .todo: return "To-Do"
-        case .idea: return "Ideas"
-        case .shopping: return "Shopping"
-        case .link: return "Links"
-        case .note: return "Other"
-        }
-    }
-
-    var symbol: String {
-        switch self {
-        case .todo: return "checklist"
-        case .idea: return "lightbulb"
-        case .shopping: return "cart"
-        case .link: return "link"
-        case .note: return "text.bubble"
-        }
+    /// The title, or the first line of text for untitled notes.
+    var displayName: String {
+        if let title, !title.isEmpty { return title }
+        let line = plainText.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        return line.trimmingCharacters(in: .whitespaces).isEmpty ? "Untitled Note" : line
     }
 }
 
-/// A text you sent yourself, imported from Messages.
-struct TextItem: Identifiable, Equatable {
-    var id: Int64
-    var text: String
-    var date: Date
-    /// nil until the classifier has sorted it.
-    var category: TextCategory?
-    var isDone: Bool
+/// A text-to-self waiting to be filed onto a sticky.
+struct PendingText {
+    let id: Int64
+    let text: String
+    let date: Date
 }
 
 enum SettingKey {
@@ -78,7 +58,6 @@ enum SettingKey {
     static let messagesLastRowID = "messages_last_rowid"
     static let selfHandles = "self_handles"
     static let watchTexts = "watch_texts"
-    static let textsBackfilled = "texts_backfilled"
 }
 
 /// Persists notes and app settings in the app's own SQLite file.
@@ -108,19 +87,36 @@ final class NoteStore {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_rowid INTEGER NOT NULL UNIQUE,
                 text TEXT NOT NULL,
-                date REAL NOT NULL,
-                category TEXT,
-                done INTEGER NOT NULL DEFAULT 0
+                date REAL NOT NULL
             )
             """)
+        try migrate()
+    }
+
+    private func migrate() throws {
         let noteColumns = try db.query("PRAGMA table_info(notes)").compactMap { $0["name"]?.string }
-        if !noteColumns.contains("on_desktop") {
-            try db.execute("ALTER TABLE notes ADD COLUMN on_desktop INTEGER NOT NULL DEFAULT 1")
-        }
         if !noteColumns.contains("deleted_at") {
-            try db.execute("ALTER TABLE notes ADD COLUMN deleted_at REAL")
+            try db.execute("ALTER TABLE notes ADD COLUMN deleted_at REAL")  // closed-at timestamp
+        }
+        if !noteColumns.contains("title") {
+            try db.execute("ALTER TABLE notes ADD COLUMN title TEXT")
+        }
+        if noteColumns.contains("on_desktop") {
+            // Notes that only lived in the old library window become Recently Closed.
+            try db.execute("UPDATE notes SET deleted_at = ?, on_desktop = 1 WHERE on_desktop = 0 AND deleted_at IS NULL",
+                           [.real(Date().timeIntervalSince1970)])
+        }
+        let textColumns = try db.query("PRAGMA table_info(texts)").compactMap { $0["name"]?.string }
+        if !textColumns.contains("routed") {
+            // Existing texts count as already handled, so they aren't re-filed.
+            try db.execute("ALTER TABLE texts ADD COLUMN routed INTEGER NOT NULL DEFAULT 1")
+        }
+        if !textColumns.contains("note_id") {
+            try db.execute("ALTER TABLE texts ADD COLUMN note_id INTEGER")
         }
     }
+
+    // MARK: Notes
 
     func allNotes() -> [Note] {
         let rows = (try? db.query("SELECT * FROM notes ORDER BY id")) ?? []
@@ -136,73 +132,42 @@ final class NoteStore {
                 isFloating: row["floating"]?.int64 == 1,
                 isTranslucent: row["translucent"]?.int64 == 1,
                 isCollapsed: row["collapsed"]?.int64 == 1,
-                isOnDesktop: row["on_desktop"]?.int64 != 0,
-                deletedAt: row["deleted_at"]?.double.map(Date.init(timeIntervalSince1970:)),
+                title: row["title"]?.string,
+                closedAt: row["deleted_at"]?.double.map(Date.init(timeIntervalSince1970:)),
                 createdAt: Date(timeIntervalSince1970: row["created_at"]?.double ?? 0),
                 updatedAt: Date(timeIntervalSince1970: row["updated_at"]?.double ?? 0))
         }
     }
 
-    func createNote(frame: NSRect, color: NoteColor, onDesktop: Bool = true) -> Note {
+    func closedNotes() -> [Note] {
+        allNotes().filter { $0.closedAt != nil }.sorted { $0.closedAt! > $1.closedAt! }
+    }
+
+    func createNote(frame: NSRect, color: NoteColor, title: String? = nil) -> Note {
         let now = Date()
         try? db.execute(
-            "INSERT INTO notes (content, color, x, y, w, h, on_desktop, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO notes (content, color, x, y, w, h, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [.blob(Data()), .text(color.rawValue),
              .real(frame.minX), .real(frame.minY), .real(frame.width), .real(frame.height),
-             .integer(onDesktop ? 1 : 0), .real(now.timeIntervalSince1970), .real(now.timeIntervalSince1970)])
+             title.map(SQLValue.text) ?? .null,
+             .real(now.timeIntervalSince1970), .real(now.timeIntervalSince1970)])
         return Note(id: db.lastInsertRowID, content: Data(), color: color, frame: frame,
-                    isFloating: false, isTranslucent: false, isCollapsed: false, isOnDesktop: onDesktop,
-                    createdAt: now, updatedAt: now)
+                    isFloating: false, isTranslucent: false, isCollapsed: false, title: title,
+                    closedAt: nil, createdAt: now, updatedAt: now)
     }
 
     func save(_ note: Note) {
         try? db.execute(
             """
             UPDATE notes SET content = ?, color = ?, x = ?, y = ?, w = ?, h = ?,
-                floating = ?, translucent = ?, collapsed = ?, on_desktop = ?, updated_at = ?
+                floating = ?, translucent = ?, collapsed = ?, title = ?, updated_at = ?
             WHERE id = ?
             """,
             [.blob(note.content), .text(note.color.rawValue),
              .real(note.frame.minX), .real(note.frame.minY), .real(note.frame.width), .real(note.frame.height),
              .integer(note.isFloating ? 1 : 0), .integer(note.isTranslucent ? 1 : 0),
-             .integer(note.isCollapsed ? 1 : 0), .integer(note.isOnDesktop ? 1 : 0),
+             .integer(note.isCollapsed ? 1 : 0), note.title.map(SQLValue.text) ?? .null,
              .real(note.updatedAt.timeIntervalSince1970), .integer(note.id)])
-    }
-
-    // MARK: Texts to self
-
-    /// Saves an imported text; returns false if it was already saved.
-    @discardableResult
-    func insertText(_ text: SelfText) -> Bool {
-        try? db.execute(
-            "INSERT OR IGNORE INTO texts (message_rowid, text, date) VALUES (?, ?, ?)",
-            [.integer(text.rowID), .text(text.text), .real(text.date.timeIntervalSince1970)])
-        return ((try? db.query("SELECT changes() AS n").first?["n"]?.int64) ?? 0) > 0
-    }
-
-    func allTexts() -> [TextItem] {
-        let rows = (try? db.query("SELECT * FROM texts ORDER BY date DESC")) ?? []
-        return rows.compactMap { row in
-            guard let id = row["id"]?.int64 else { return nil }
-            return TextItem(
-                id: id,
-                text: row["text"]?.string ?? "",
-                date: Date(timeIntervalSince1970: row["date"]?.double ?? 0),
-                category: row["category"]?.string.flatMap(TextCategory.init(rawValue:)),
-                isDone: row["done"]?.int64 == 1)
-        }
-    }
-
-    func setCategory(_ category: TextCategory, forText id: Int64) {
-        try? db.execute("UPDATE texts SET category = ? WHERE id = ?", [.text(category.rawValue), .integer(id)])
-    }
-
-    func setDone(_ done: Bool, forText id: Int64) {
-        try? db.execute("UPDATE texts SET done = ? WHERE id = ?", [.integer(done ? 1 : 0), .integer(id)])
-    }
-
-    func deleteText(id: Int64) {
-        try? db.execute("DELETE FROM texts WHERE id = ?", [.integer(id)])
     }
 
     /// Permanently removes a note.
@@ -210,21 +175,54 @@ final class NoteStore {
         try? db.execute("DELETE FROM notes WHERE id = ?", [.integer(id)])
     }
 
-    /// Moves a note to Recently Deleted (and off the desktop).
-    func trashNote(id: Int64) {
-        try? db.execute("UPDATE notes SET deleted_at = ?, on_desktop = 0 WHERE id = ?",
+    /// Moves a note to Recently Closed.
+    func closeNote(id: Int64) {
+        try? db.execute("UPDATE notes SET deleted_at = ? WHERE id = ?",
                         [.real(Date().timeIntervalSince1970), .integer(id)])
     }
 
-    func restoreNote(id: Int64) {
+    func reopenNote(id: Int64) {
         try? db.execute("UPDATE notes SET deleted_at = NULL WHERE id = ?", [.integer(id)])
     }
 
-    /// Permanently removes notes that have been in Recently Deleted longer than `age`.
-    func purgeTrash(olderThan age: TimeInterval) {
+    /// Permanently removes notes that have been closed longer than `age`.
+    func purgeClosedNotes(olderThan age: TimeInterval) {
         try? db.execute("DELETE FROM notes WHERE deleted_at IS NOT NULL AND deleted_at < ?",
                         [.real(Date().timeIntervalSince1970 - age)])
     }
+
+    // MARK: Texts to self
+
+    /// Saves an imported text for routing; ignores texts already saved.
+    func insertText(_ text: SelfText) {
+        try? db.execute(
+            "INSERT OR IGNORE INTO texts (message_rowid, text, date, routed) VALUES (?, ?, ?, 0)",
+            [.integer(text.rowID), .text(text.text), .real(text.date.timeIntervalSince1970)])
+    }
+
+    func pendingTexts() -> [PendingText] {
+        let rows = (try? db.query("SELECT id, text, date FROM texts WHERE routed = 0 ORDER BY date")) ?? []
+        return rows.compactMap { row in
+            guard let id = row["id"]?.int64, let text = row["text"]?.string else { return nil }
+            return PendingText(id: id, text: text, date: Date(timeIntervalSince1970: row["date"]?.double ?? 0))
+        }
+    }
+
+    func markRouted(textID: Int64, noteID: Int64, filedText: String) {
+        try? db.execute("UPDATE texts SET routed = 1, note_id = ?, text = ? WHERE id = ?",
+                        [.integer(noteID), .text(filedText), .integer(textID)])
+    }
+
+    /// Texts filed onto a note, for the hover timestamps.
+    func routedTexts(noteID: Int64) -> [(text: String, date: Date)] {
+        let rows = (try? db.query("SELECT text, date FROM texts WHERE note_id = ?", [.integer(noteID)])) ?? []
+        return rows.compactMap { row in
+            guard let text = row["text"]?.string else { return nil }
+            return (text, Date(timeIntervalSince1970: row["date"]?.double ?? 0))
+        }
+    }
+
+    // MARK: Settings
 
     func setting(_ key: String) -> String? {
         try? db.query("SELECT value FROM settings WHERE key = ?", [.text(key)]).first?["value"]?.string
